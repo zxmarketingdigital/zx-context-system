@@ -21,10 +21,16 @@ O --body aceita markdown. Convenção sugerida de corpo:
   **Pendências:** ...
 """
 import argparse
+import contextlib
 import datetime
 import os
 import re
 import sys
+
+try:
+    import fcntl
+except ImportError:  # Windows: sem file lock — degrada pra no-op
+    fcntl = None
 
 HOME = os.path.expanduser("~")
 STORE = os.environ.get("ZX_WORKLOG_DIR") or os.path.join(HOME, ".context-worklogs")
@@ -52,6 +58,27 @@ def short_path(path):
 
 def project_name(path):
     return os.path.basename(os.path.abspath(path.rstrip("/"))) or "raiz"
+
+
+def _cell(value):
+    """Escapa `|` pra não quebrar o parse da tabela do INDEX (4 colunas)."""
+    return str(value).replace("|", "¦")
+
+
+@contextlib.contextmanager
+def _index_lock():
+    """Lock exclusivo em volta do read-modify-write do INDEX — evita lost-update
+    quando duas sessões rodam `add` ao mesmo tempo. No-op se fcntl indisponível."""
+    os.makedirs(STORE, exist_ok=True)
+    if fcntl is None:
+        yield
+        return
+    with open(INDEX + ".lock", "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def cmd_add(args):
@@ -90,28 +117,28 @@ def cmd_add(args):
     with open(hist, "w", encoding="utf-8") as f:
         f.write(new_content)
 
-    # --- 2. Índice central (upsert por path) ---
-    os.makedirs(STORE, exist_ok=True)
-    rows = {}
-    order = []
-    if os.path.exists(INDEX):
-        with open(INDEX, encoding="utf-8") as f:
-            for line in f:
-                m = re.match(r"\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*$", line)
-                if m and m.group(2) not in ("Path", "------"):
-                    rows[m.group(2)] = (m.group(1), m.group(2), m.group(3), m.group(4))
-                    order.append(m.group(2))
-    sp = short_path(proj_dir)
-    if sp not in rows:
-        order.append(sp)
-    rows[sp] = (project_name(proj_dir), sp, date, summary)
-    # ordena por última sessão desc
-    order_sorted = sorted(set(order), key=lambda p: rows[p][2], reverse=True)
-    with open(INDEX, "w", encoding="utf-8") as f:
-        f.write(INDEX_HEADER)
-        for p in order_sorted:
-            name, pth, dt, summ = rows[p]
-            f.write(f"| {name} | {pth} | {dt} | {summ} |\n")
+    # --- 2. Índice central (upsert por path) — sob lock exclusivo ---
+    with _index_lock():
+        rows = {}
+        order = []
+        if os.path.exists(INDEX):
+            with open(INDEX, encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r"\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*$", line)
+                    if m and m.group(2) not in ("Path", "------"):
+                        rows[m.group(2)] = (m.group(1), m.group(2), m.group(3), m.group(4))
+                        order.append(m.group(2))
+        sp = short_path(proj_dir)
+        if sp not in rows:
+            order.append(sp)
+        rows[sp] = (project_name(proj_dir), sp, date, summary)
+        # ordena por última sessão desc
+        order_sorted = sorted(set(order), key=lambda p: rows[p][2], reverse=True)
+        with open(INDEX, "w", encoding="utf-8") as f:
+            f.write(INDEX_HEADER)
+            for p in order_sorted:
+                name, pth, dt, summ = rows[p]
+                f.write(f"| {_cell(name)} | {_cell(pth)} | {_cell(dt)} | {_cell(summ)} |\n")
 
     print(f"✓ histórico gravado: {short_path(hist)}")
     print(f"✓ índice atualizado: {short_path(INDEX)} ({len(rows)} projeto(s))")
